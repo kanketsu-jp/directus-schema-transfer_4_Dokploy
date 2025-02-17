@@ -1,0 +1,274 @@
+= Directusのコレクションやファイル構成を簡単に移管する方法
+リポジトリ名: directus-schema-transfer
+:toc:
+:toclevels: 2
+:sectnums:
+
+== 概要
+
+本リポジトリは、Directusのスキーマ（コレクションやフィールド）およびファイル構成（フォルダー設定）を、あるDirectus環境（ソース）から別のDirectus環境（ターゲット）へ自動的に移管するためのBashスクリプトを提供します。本スクリプトは以下の処理を実施します：
+
+* ソースコンテナ内の既存スナップショットファイル（/tmp/schema.yaml）を削除し、常に最新のスナップショットを取得
+* ソース環境から新しいスナップショットを取得し、そのファイルをホストにコピー、さらにターゲット環境のコンテナへ転送して適用
+* ソース環境のアップロードボリューム（ファイルストレージ）をアーカイブし、ターゲット環境へ展開
+* MIGRATE_FOLDERS_ONLY の設定により、画像のファイル構成（directus_foldersテーブル）のみを移管（画像ファイル自体はアップロードボリュームのコピーで移管）
+* 必要に応じて、ターゲットコンテナの再起動を実施
+* 最後に、アップロードデータのバックアップファイルの保存場所を表示
+
+== 特徴
+
+* **自動クリーンアップ:** ソースコンテナ内の /tmp/schema.yaml を削除し、新しいスナップショットで上書きするため、古いバックアップファイルが残りません。
+* **スキーマ移管:** 最新のスナップショットを取得し、ターゲット環境に適用します。
+* **ファイル・フォルダ移管:** アップロードボリュームのコピーと、directus_foldersテーブルのデータ移管により、画像ファイルおよびフォルダー構成を移管します。
+* **デバッグログ:** DEBUG_MODEを有効にすることで、詳細なログ出力が行われ、トラブルシューティングが容易になります。
+* **環境検証:** ユーザー入力の識別子から生成したコンテナが存在するかを事前に確認します。
+* **非破壊性:** ソース環境に変更を加えず、ターゲット環境にのみ変更を適用します。
+
+== セットアップと使用方法
+
+=== 1. 前提条件
+
+* Dockerがインストールされ、利用可能であること。
+* DirectusがDockerコンテナ上で稼働していること。
+* 各コンテナには PostgreSQLアクセス用の環境変数 `DB_PASSWORD` が正しく設定されていること。
+* 移管前にソースおよびターゲット環境のバックアップを必ず取得してください。
+
+=== 2. リポジトリのクローンと準備
+
+1. 本リポジトリをクローンします:
+
+[source, bash]
+----
+git clone https://github.com/yourusername/directus-schema-transfer.git
+----
+
+2. 作業ディレクトリ（例: ホームディレクトリ）に移動します:
+
+[source, bash]
+----
+cd ~
+----
+
+=== 3. スクリプトファイルの作成
+
+1. お好みのテキストエディタ（例: nano）でスクリプトファイルを作成します:
+
+[source, bash]
+----
+nano deploy_schema_transfer.sh
+----
+
+2. 以下の内容をエディタに貼り付けてください:
+
+[listing, role="bash", title="deploy_schema_transfer.sh"]
+----
+#!/bin/bash
+# DEBUG_MODE: 1 なら詳細ログを出力（初期値: 1）
+DEBUG_MODE=1
+# MIGRATE_FOLDERS_ONLY: 1 なら directus_files ではなく directus_folders テーブル（フォルダー構造）のみ移管
+MIGRATE_FOLDERS_ONLY=1
+
+if [ "$DEBUG_MODE" -eq 1 ]; then
+  set -x
+fi
+set -e
+
+# デバッグログ用関数
+debug_log() {
+  if [ "$DEBUG_MODE" -eq 1 ]; then
+    echo "[DEBUG] $1"
+  fi
+}
+
+# エラー発生時にメッセージを出して終了する関数
+error_exit() {
+  echo "❌ エラー: $1" >&2
+  exit 1
+}
+
+# 対象コンテナ内に postgresql-client があるかチェックし、
+# なければ root 権限で利用可能なパッケージマネージャで自動インストールを試みる
+install_pg_client_if_missing() {
+  local container="$1"
+  debug_log "Checking pg_dump and pg_restore in container $container"
+  echo "【チェック】コンテナ $container 内に pg_dump と pg_restore が存在するか確認中..."
+  if docker exec -it "$container" sh -c "command -v pg_dump && command -v pg_restore" > /dev/null 2>&1; then
+    echo "pg_dump と pg_restore は既にインストール済みです。"
+  else
+    echo "postgresql-client が見つかりません。$container 内に自動インストールを試みます..."
+    if docker exec -it --user root "$container" sh -c "command -v apt-get" > /dev/null 2>&1; then
+      debug_log "apt-get を使用します: $container"
+      docker exec -it --user root "$container" sh -c "apt-get update && apt-get install -y postgresql-client" || error_exit "コンテナ $container 内で postgresql-client の自動インストールに失敗しました"
+    elif docker exec -it --user root "$container" sh -c "command -v apk" > /dev/null 2>&1; then
+      debug_log "apk を使用します: $container"
+      docker exec -it --user root "$container" sh -c "apk update && apk add postgresql-client" || error_exit "コンテナ $container 内で postgresql-client の自動インストールに失敗しました"
+    else
+      error_exit "コンテナ $container 内で利用可能なパッケージマネージャが見つかりません。"
+    fi
+  fi
+}
+
+# 環境識別子からコンテナ名およびボリューム名を生成する関数
+get_container_name() {
+  echo "directus-$1-directus-1"
+}
+
+get_volume_name() {
+  echo "directus_uploads-directus-$1"
+}
+
+# ユーザーに環境識別子の入力を促す
+read -p "開発環境の識別子 (例: 883409): " ENV_A
+read -p "本番環境の識別子 (例: f09f1b): " ENV_B
+
+CONTAINER_A=$(get_container_name "$ENV_A")
+CONTAINER_B=$(get_container_name "$ENV_B")
+VOLUME_A=$(get_volume_name "$ENV_A")
+VOLUME_B=$(get_volume_name "$ENV_B")
+
+# コンテナの存在確認
+docker inspect "$CONTAINER_A" > /dev/null 2>&1 || error_exit "開発環境コンテナ $CONTAINER_A が存在しません。"
+docker inspect "$CONTAINER_B" > /dev/null 2>&1 || error_exit "本番環境コンテナ $CONTAINER_B が存在しません。"
+
+echo ""
+echo "🔍 環境設定:"
+echo "  開発環境コンテナ: $CONTAINER_A"
+echo "  本番環境コンテナ: $CONTAINER_B"
+echo "  開発環境ボリューム: $VOLUME_A"
+echo "  本番環境ボリューム: $VOLUME_B"
+echo "  ストレージパス: /directus/uploads"
+
+read -p "本番環境コンテナを再デプロイしますか? (y/n): " REDEPLOY
+
+echo ""
+echo "🎬 移管処理を開始します..."
+
+# 既存のスナップショットファイルを削除（ソースコンテナ内）
+docker exec -it "$CONTAINER_A" rm -f /tmp/schema.yaml || debug_log "既存のスナップショットが存在しなかったか、削除に失敗しました。"
+
+# 【Step 1】ソース（開発環境）から新しいスナップショットを取得
+echo "【Step 1】開発環境 ($CONTAINER_A) からスナップショットを取得中..."
+docker exec -it "$CONTAINER_A" /bin/sh -c "npx directus schema snapshot /tmp/schema.yaml" || error_exit "スナップショットの取得に失敗しました"
+
+# 【Step 2】スナップショットファイルをホストにコピー
+echo "【Step 2】開発環境コンテナからホストへスナップショットファイルをコピー中..."
+docker cp "$CONTAINER_A":/tmp/schema.yaml ./schema.yaml || error_exit "スナップショットファイルのコピーに失敗しました"
+
+# 【Step 3】ホスト上のスナップショットファイルをターゲット環境へコピー
+echo "【Step 3】ホスト上のスナップショットファイルを本番環境 ($CONTAINER_B) コンテナへ転送中..."
+docker cp ./schema.yaml "$CONTAINER_B":/tmp/schema.yaml || error_exit "スナップショットファイルのターゲットへのコピーに失敗しました"
+
+# 【Step 4】ターゲット環境でスナップショットを適用（コレクション構造更新）
+echo "【Step 4】本番環境コンテナ内でスナップショットを適用中..."
+docker exec -it "$CONTAINER_B" /bin/sh -c "npx directus schema apply /tmp/schema.yaml" || error_exit "スナップショットの適用に失敗しました"
+
+# 【Step 5】アップロードボリューム（ファイル）の移管
+echo "【Step 5】ストレージデータを移管中..."
+echo "開発環境 ($VOLUME_A) から本番環境 ($VOLUME_B) にアップロードファイルをコピー中..."
+docker run --rm -v "$VOLUME_A":/data -v "$(pwd)":/backup alpine tar -czvf /backup/uploads.tar.gz -C /data . || error_exit "ストレージデータのアーカイブに失敗しました"
+docker run --rm -v "$(pwd)":/backup -v "$VOLUME_B":/data alpine tar -xzvf /backup/uploads.tar.gz -C /data || error_exit "ストレージデータの展開に失敗しました"
+
+if [ "$MIGRATE_FOLDERS_ONLY" -eq 1 ]; then
+  # 【Step 6】directus_folders テーブルのデータ（フォルダー構造）のエクスポート
+  echo "【Step 6】開発環境から directus_folders テーブルのデータ（フォルダー構造）をエクスポート中..."
+  docker exec -it "$CONTAINER_A" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD pg_dump -h database -U directus -t directus_folders -a -Fp" > directus_folders.sql || error_exit "directus_folders テーブルのエクスポートに失敗しました"
+  # 不要な警告行と設定行を削除
+  sed -i '/^pg_dump:/d' directus_folders.sql
+  sed -i '/^SET transaction_timeout/d' directus_folders.sql
+  debug_log "Exported directus_folders dump (first 10 lines):"
+  if [ "$DEBUG_MODE" -eq 1 ]; then
+    head -n 10 directus_folders.sql
+  fi
+
+  # 【Step 7】ターゲット環境の directus_folders テーブルのデータを置換
+  echo "【Step 7】本番環境の directus_folders テーブルのデータを削除し、エクスポートデータをインポート中..."
+  docker exec -it "$CONTAINER_B" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD psql -h database -U directus -d directus -c 'DELETE FROM directus_folders;'" || error_exit "ターゲット環境でのデータ削除に失敗しました"
+  docker cp directus_folders.sql "$CONTAINER_B":/tmp/directus_folders.sql || error_exit "directus_folders.sql のターゲットへのコピーに失敗しました"
+  docker exec -it "$CONTAINER_B" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD psql -h database -U directus -d directus -f /tmp/directus_folders.sql" || error_exit "directus_folders テーブルのインポートに失敗しました"
+else
+  // 【Alternative Step 6】directus_files テーブルのデータ移管（MIGRATE_FOLDERS_ONLY=0の場合）
+  echo "【Step 6】開発環境から directus_files テーブルのデータをエクスポート中..."
+  install_pg_client_if_missing "$CONTAINER_A"
+  docker exec -it "$CONTAINER_A" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD pg_dump -h database -U directus -t directus_files -a -Fc -f /tmp/directus_files.dump" || error_exit "directus_files テーブルのエクスポートに失敗しました"
+  docker cp "$CONTAINER_A":/tmp/directus_files.dump ./directus_files.dump || error_exit "directus_files.dump のコピーに失敗しました"
+  echo "【Step 7】本番環境に directus_files テーブルのデータをインポート中..."
+  install_pg_client_if_missing "$CONTAINER_B"
+  docker cp ./directus_files.dump "$CONTAINER_B":/tmp/directus_files.dump || error_exit "directus_files.dump のターゲットへのコピーに失敗しました"
+  docker exec -it "$CONTAINER_B" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD pg_restore -a --disable-triggers -h database -U directus -d directus /tmp/directus_files.dump" || error_exit "directus_files テーブルのインポートに失敗しました"
+fi
+
+# 【Step 8】必要に応じてターゲット環境の Directus コンテナを再デプロイ
+if [[ "$REDEPLOY" =~ ^[Yy]$ ]]; then
+    echo "【Step 8】本番環境コンテナを再デプロイ中..."
+    docker restart "$CONTAINER_B" || error_exit "ターゲットコンテナの再起動に失敗しました"
+    echo "本番環境コンテナの再デプロイが完了しました。"
+else
+    echo "再デプロイはスキップされました。"
+fi
+
+# バックアップファイルの保存場所を表示
+echo "バックアップファイル (uploads のアーカイブ) は $(pwd)/uploads.tar.gz に保存されています。"
+
+echo ""
+echo "✨✨✨ 移管処理がすべて完了しました! ✨✨✨"
+echo "----------------------------------------------------"
+----
+
+=== 2.4 保存と終了
+
+nano では、`Ctrl+O` で保存し、`Ctrl+X` で終了してください。
+
+== 3. スクリプトに実行権限を付与
+
+以下のコマンドを実行して、スクリプトに実行権限を付与します:
+
+[source, bash]
+----
+chmod +x deploy_schema_transfer.sh
+----
+
+== 4. スクリプトの実行方法
+
+ホームディレクトリにいる状態で、以下のコマンドを実行してください:
+
+[source, bash]
+----
+./deploy_schema_transfer.sh
+----
+
+実行中、以下の入力が求められます：
+
+* 開発環境の識別子 (例: 883409)
+* 本番環境の識別子 (例: f09f1b)
+* 本番環境コンテナの再デプロイの有無  
+  再デプロイが必要な場合は `y`、不要な場合は `n` を入力してください。
+
+== 注意点
+
+* スクリプト実行前に、必ず各環境のバックアップを取得してください。
+* 本スクリプトは、Directus のスキーマ（コレクション）および画像のファイル構成（directus_foldersテーブル）のみを移管します。
+  - 画像ファイル自体はアップロードボリュームのコピーで移管されます。
+  - 記事等のコレクションアイテムは移管されません。
+* スクリプトは、既存のスナップショットやバックアップファイルを自動的に削除・上書きし、不要なゴミが残らないように設計されています。
+
+== 議論とフィードバック
+
+本リポジトリは、Directusの設定を簡単に移管する方法を共有し、同じ手法を実現したい方々の手助けを目的としています。  
+もし、Directusのコレクションやファイル構成を一括で移管するより良い方法がある場合は、GitHub Issues または Pull Request でご提案ください。
+
+== まとめ
+
+この手順書に従い、ホームディレクトリに *deploy_schema_transfer.sh* を作成・実行することで、Directus のスキーマおよび画像のファイル構成を安全かつ効率的に移管できます。  
+初回実装時には、対象コンテナの存在確認や必要なツールの自動インストールも行われるため、環境に合わせた調整が容易です。
+
+== ライセンス
+
+[例: MIT License]
+
+== 貢献
+
+改善や提案は大歓迎です。GitHub Issues または Pull Request でご連絡ください。
+
+== お問い合わせ
+
+ご質問やフィードバックは、GitHub Issues をご利用ください。
