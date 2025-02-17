@@ -39,7 +39,7 @@ This repository provides a Bash script that automates the process of transferrin
 
 [source, bash]
 ----
-git clone https://github.com/yourusername/directus-schema-transfer.git
+git clone https://github.com/kanketsu-jp/directus-schema-transfer_4_Dokploy.git
 ----
 
 2. Change to your home directory (or your working directory):
