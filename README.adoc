@@ -7,7 +7,8 @@ Repository Name: directus-schema-transfer
 == Overview
 
 This repository provides a Bash script that automates the process of transferring Directus schema (collections and fields) and file structure (folder configurations) from one Directus environment (source) to another (target). The script performs the following tasks:
-* Removes any existing snapshot file on the source container to ensure only the latest snapshot is used.
+
+* Removes any existing snapshot file on the source container so that only the latest snapshot is used.
 * Retrieves a fresh schema snapshot from the source environment.
 * Transfers the snapshot file from the source container to the host and then to the target container.
 * Applies the snapshot in the target environment.
@@ -17,13 +18,13 @@ This repository provides a Bash script that automates the process of transferrin
 
 == Features
 
-* **Automated Cleanup:** Existing `/tmp/schema.yaml` on the source container is removed so that old backups are not retained.
+* **Automated Cleanup:** Existing `/tmp/schema.yaml` on the source container is removed so old backups are not retained.
 * **Schema Transfer:** The latest schema snapshot is obtained and applied to the target environment.
 * **File and Folder Migration:** Upload files are transferred via an archive of the uploads volume, and folder structure data is migrated from the `directus_folders` table.
-* **Debug Logging:** Detailed logs are output when DEBUG_MODE is enabled.
+* **Debug Logging:** Detailed logs are output when `DEBUG_MODE` is enabled.
 * **Environment Validation:** The script verifies that the specified source and target containers exist.
 * **Non-Destructive:** The source environment remains unchanged; only the target is modified.
-* **Language Switching:** By setting the environment variable LANG (e.g., LANG=ja), you can switch the script’s messages between English and Japanese.
+* **Language Switching:** By setting the environment variable `LANG` (e.g., `LANG=ja`), you can switch the script’s messages between English and Japanese.
 
 == Setup and Usage
 
@@ -34,48 +35,43 @@ This repository provides a Bash script that automates the process of transferrin
 * The containers must have the `DB_PASSWORD` environment variable properly set for PostgreSQL access.
 * Always back up both the source and target environments before proceeding.
 
-=== 2. Clone and Prepare the Repository
+=== 2. Clone the Repository
 
-1. Change to your home directory and clone the repository:
-[source, bash]
+1. Change to your home directory (or any working directory) and clone the repository:
+
+[source,bash]
 ----
 cd ~
-git clone --branch english --single-branch https://github.com/yourusername/directus-schema-transfer.git
+git clone https://github.com/yourusername/directus-schema-transfer.git
 ----
 
 2. Change to the repository directory:
-[source, bash]
+
+[source,bash]
 ----
 cd directus-schema-transfer
 ----
 
-=== 3. Script Setup
+=== 3. Running the Script
 
-1. Create the script file using your preferred text editor (the script is named **directus-migrate.sh**):
-[source, bash]
-----
-nano directus-migrate.sh
-----
-2. Paste the content from the listing above into the file, then save and exit.
+If necessary, give the script execution permissions:
 
-=== 4. Set Script Permissions
-
-[source, bash]
+[source,bash]
 ----
 chmod +x directus-migrate.sh
 ----
 
-=== 5. Running the Script
+Then run it:
 
-Ensure you are in your home directory and run:
-[source, bash]
+[source,bash]
 ----
 ./directus-migrate.sh
 ----
+
 You will be prompted for:
-* The source environment identifier (e.g., 883409)
-* The target environment identifier (e.g., f09f1b)
-* Whether to redeploy the target container (enter `y` or `n`)
+* The source environment identifier (e.g., `883409`)
+* The target environment identifier (e.g., `f09f1b`)
+* Whether to redeploy the target container (`y` or `n`)
 
 == Notes
 
@@ -84,19 +80,20 @@ You will be prompted for:
   - Image files themselves are transferred via the uploads volume archive.
   - Collection items (e.g., articles) are not migrated.
 * Old snapshots and backup files are automatically removed and overwritten.
-* To display messages in Japanese, set the environment variable LANG=ja before execution:
-[source, bash]
+* To display messages in Japanese, set the environment variable `LANG=ja` before execution:
+
+[source,bash]
 ----
 LANG=ja ./directus-migrate.sh
 ----
 
 == Discussion and Feedback
 
-This repository is shared to help others who need a simple method to transfer Directus configurations. If you know of a better, more comprehensive way to perform a bulk migration of Directus collections and file structures, please share your ideas via GitHub Issues or pull requests.
+This repository is shared to help others who need a simple method to transfer Directus configurations. If you know of a better or more comprehensive way to perform a bulk migration of Directus collections and file structures, please share your ideas via GitHub Issues or pull requests.
 
 == Summary
 
-By following this guide, you can easily set up and run *directus-migrate.sh* in your home directory to safely and efficiently migrate Directus schema and file configurations from one environment to another.
+By following this guide, you can safely and efficiently migrate Directus schema and file configurations from one environment to another using *directus-migrate.sh*.
 
 == License
 
