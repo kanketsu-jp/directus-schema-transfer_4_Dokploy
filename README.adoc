@@ -1,0 +1,270 @@
+= Directus Schema Transfer Script
+Repository Name: directus-schema-transfer
+:toc:
+:toclevels: 2
+:sectnums:
+
+== Overview
+
+This repository provides a Bash script that automates the process of transferring Directus schema (i.e. collections and fields) and file structure (i.e. folder configurations) from one Directus environment (source) to another (target). In our case, the script:
+* Deletes any existing snapshot file on the source container so that only the latest snapshot is used.
+* Retrieves a fresh schema snapshot from the source environment.
+* Transfers the snapshot file from the source container to the host and then to the target container.
+* Applies the snapshot in the target environment.
+* Archives the uploads volume (file storage) from the source and extracts it into the target.
+* Exports the folder structure data (from the `directus_folders` table) and imports it into the target environment.
+* Optionally redeploys the target container.
+
+== Features
+
+* **Automated Cleanup:** Removes the existing `/tmp/schema.yaml` on the source container before taking a new snapshot.
+* **Schema Transfer:** Obtains a fresh schema snapshot from the source, transfers it to the target, and applies it.
+* **File and Folder Migration:** Archives and transfers the uploads volume, and migrates folder structure data.
+* **Debug Logging:** When enabled, outputs detailed logs for troubleshooting.
+* **Environment Validation:** Checks that the specified source and target containers exist.
+* **Non-Destructive:** Operates in a read-only mode on the source environment; only the target is modified.
+
+== Setup and Usage
+
+=== 1. Prerequisites
+
+* Docker must be installed and accessible.
+* Directus should be deployed using Docker containers.
+* The containers must have the environment variable `DB_PASSWORD` properly set for PostgreSQL access.
+* Ensure you have a backup of both source and target environments before proceeding.
+
+=== 2. Clone and Prepare the Repository
+
+1. Clone this repository:
+
+[source, bash]
+----
+git clone https://github.com/yourusername/directus-schema-transfer.git
+----
+
+2. Change to your home directory (or your working directory):
+
+[source, bash]
+----
+cd ~
+----
+
+=== 3. Create the Script File
+
+Open your favorite text editor (e.g., nano) to create the script file:
+
+[source, bash]
+----
+nano deploy_schema_transfer.sh
+----
+
+Paste the following content into the editor:
+
+[listing, role="bash", title="deploy_schema_transfer.sh"]
+----
+#!/bin/bash
+# DEBUG_MODE: 1 enables detailed logging (default: 0)
+DEBUG_MODE=0
+# MIGRATE_FOLDERS_ONLY: 1 transfers only the directus_folders table (folder structure), not directus_files
+MIGRATE_FOLDERS_ONLY=1
+
+if [ "$DEBUG_MODE" -eq 1 ]; then
+  set -x
+fi
+set -e
+
+# Debug log function
+debug_log() {
+  if [ "$DEBUG_MODE" -eq 1 ]; then
+    echo "[DEBUG] $1"
+  fi
+}
+
+# Error handler function
+error_exit() {
+  echo "❌ Error: $1" >&2
+  exit 1
+}
+
+# Check if postgresql-client exists in a container; if not, install it using a package manager
+install_pg_client_if_missing() {
+  local container="$1"
+  debug_log "Checking pg_dump and pg_restore in container $container"
+  echo "【Check】Verifying pg_dump and pg_restore in container $container..."
+  if docker exec -it "$container" sh -c "command -v pg_dump && command -v pg_restore" > /dev/null 2>&1; then
+    echo "pg_dump and pg_restore are already installed."
+  else
+    echo "postgresql-client not found in $container. Attempting installation..."
+    if docker exec -it --user root "$container" sh -c "command -v apt-get" > /dev/null 2>&1; then
+      debug_log "Using apt-get in $container"
+      docker exec -it --user root "$container" sh -c "apt-get update && apt-get install -y postgresql-client" || error_exit "Failed to install postgresql-client in $container"
+    elif docker exec -it --user root "$container" sh -c "command -v apk" > /dev/null 2>&1; then
+      debug_log "Using apk in $container"
+      docker exec -it --user root "$container" sh -c "apk update && apk add postgresql-client" || error_exit "Failed to install postgresql-client in $container"
+    else
+      error_exit "No suitable package manager found in $container."
+    fi
+  fi
+}
+
+# Functions to generate container and volume names from an environment identifier
+get_container_name() {
+  echo "directus-$1-directus-1"
+}
+
+get_volume_name() {
+  echo "directus_uploads-directus-$1"
+}
+
+# Input environment identifiers
+read -p "Source environment identifier (e.g., 883409): " ENV_A
+read -p "Target environment identifier (e.g., f09f1b): " ENV_B
+
+CONTAINER_A=$(get_container_name "$ENV_A")
+CONTAINER_B=$(get_container_name "$ENV_B")
+VOLUME_A=$(get_volume_name "$ENV_A")
+VOLUME_B=$(get_volume_name "$ENV_B")
+
+# Verify that the specified containers exist
+docker inspect "$CONTAINER_A" > /dev/null 2>&1 || error_exit "Source container $CONTAINER_A does not exist."
+docker inspect "$CONTAINER_B" > /dev/null 2>&1 || error_exit "Target container $CONTAINER_B does not exist."
+
+echo ""
+echo "🔍 Environment Settings:"
+echo "  Source container: $CONTAINER_A"
+echo "  Target container: $CONTAINER_B"
+echo "  Source volume: $VOLUME_A"
+echo "  Target volume: $VOLUME_B"
+echo "  Storage path: /directus/uploads"
+
+read -p "Redeploy target container after migration? (y/n): " REDEPLOY
+
+echo ""
+echo "🎬 Starting Migration Process..."
+
+# Remove existing snapshot in the source container to ensure a fresh snapshot
+docker exec -it "$CONTAINER_A" rm -f /tmp/schema.yaml || debug_log "No existing snapshot to remove."
+
+# Step 1: Take a new schema snapshot from the source container
+echo "【Step 1】Taking schema snapshot from Source ($CONTAINER_A)..."
+docker exec -it "$CONTAINER_A" /bin/sh -c "npx directus schema snapshot /tmp/schema.yaml" || error_exit "Failed to take snapshot."
+
+# Step 2: Copy the snapshot file from the source container to the host
+echo "【Step 2】Copying snapshot file from Source to host..."
+docker cp "$CONTAINER_A":/tmp/schema.yaml ./schema.yaml || error_exit "Failed to copy snapshot file."
+
+# Step 3: Transfer the snapshot file from the host to the target container
+echo "【Step 3】Transferring snapshot file to Target ($CONTAINER_B)..."
+docker cp ./schema.yaml "$CONTAINER_B":/tmp/schema.yaml || error_exit "Failed to copy snapshot file to target."
+
+# Step 4: Apply the schema snapshot in the target container
+echo "【Step 4】Applying schema snapshot in Target..."
+docker exec -it "$CONTAINER_B" /bin/sh -c "npx directus schema apply /tmp/schema.yaml" || error_exit "Failed to apply schema."
+
+# Step 5: Migrate storage data (uploads)
+echo "【Step 5】Migrating storage data..."
+echo "Copying uploads from Source ($VOLUME_A) to Target ($VOLUME_B)..."
+docker run --rm -v "$VOLUME_A":/data -v "$(pwd)":/backup alpine tar -czvf /backup/uploads.tar.gz -C /data . || error_exit "Failed to archive storage data."
+docker run --rm -v "$(pwd)":/backup -v "$VOLUME_B":/data alpine tar -xzvf /backup/uploads.tar.gz -C /data || error_exit "Failed to extract storage data."
+
+if [ "$MIGRATE_FOLDERS_ONLY" -eq 1 ]; then
+  # Step 6: Export folder structure (directus_folders table) from the source
+  echo "【Step 6】Exporting folder structure from Source (directus_folders)..."
+  docker exec -it "$CONTAINER_A" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD pg_dump -h database -U directus -t directus_folders -a -Fp" > directus_folders.sql || error_exit "Failed to export folder structure."
+  # Remove pg_dump warning lines and unwanted configuration parameters
+  sed -i '/^pg_dump:/d' directus_folders.sql
+  sed -i '/^SET transaction_timeout/d' directus_folders.sql
+  debug_log "Exported directus_folders dump (first 10 lines):"
+  if [ "$DEBUG_MODE" -eq 1 ]; then
+    head -n 10 directus_folders.sql
+  fi
+
+  # Step 7: Import folder structure into the target
+  echo "【Step 7】Replacing folder structure data in Target..."
+  docker exec -it "$CONTAINER_B" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD psql -h database -U directus -d directus -c 'DELETE FROM directus_folders;'" || error_exit "Failed to delete existing folder structure in target."
+  docker cp directus_folders.sql "$CONTAINER_B":/tmp/directus_folders.sql || error_exit "Failed to copy folder structure dump to target."
+  docker exec -it "$CONTAINER_B" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD psql -h database -U directus -d directus -f /tmp/directus_folders.sql" || error_exit "Failed to import folder structure into target."
+else
+  # Alternative Step 6: (For migrating directus_files instead of folder structure)
+  echo "【Step 6】Exporting file metadata from Source (directus_files)..."
+  install_pg_client_if_missing "$CONTAINER_A"
+  docker exec -it "$CONTAINER_A" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD pg_dump -h database -U directus -t directus_files -a -Fc -f /tmp/directus_files.dump" || error_exit "Failed to export file metadata."
+  docker cp "$CONTAINER_A":/tmp/directus_files.dump ./directus_files.dump || error_exit "Failed to copy file metadata dump."
+  echo "【Step 7】Importing file metadata into Target..."
+  install_pg_client_if_missing "$CONTAINER_B"
+  docker cp ./directus_files.dump "$CONTAINER_B":/tmp/directus_files.dump || error_exit "Failed to copy file metadata dump to target."
+  docker exec -it "$CONTAINER_B" /bin/sh -c "PGPASSWORD=\$DB_PASSWORD pg_restore -a --disable-triggers -h database -U directus -d directus /tmp/directus_files.dump" || error_exit "Failed to import file metadata into target."
+fi
+
+# Step 8: Optionally redeploy the target container
+if [[ "$REDEPLOY" =~ ^[Yy]$ ]]; then
+    echo "【Step 8】Redeploying Target container..."
+    docker restart "$CONTAINER_B" || error_exit "Failed to restart target container."
+    echo "Target container redeployed successfully."
+else
+    echo "Redeployment skipped."
+fi
+
+# Display backup file location
+echo "Backup file (uploads archive) is stored at $(pwd)/uploads.tar.gz"
+
+echo ""
+echo "✨✨✨ Migration process completed successfully! ✨✨✨"
+echo "----------------------------------------------------"
+----
+
+=== 2.4 Save and Exit
+
+In nano, press `Ctrl+O` to save and `Ctrl+X` to exit.
+
+== 4. Set Script Permissions
+
+Give the script execution permission with the following command:
+
+[source, bash]
+----
+chmod +x deploy_schema_transfer.sh
+----
+
+== 5. Running the Script
+
+Ensure you are in your home directory and run:
+
+[source, bash]
+----
+./deploy_schema_transfer.sh
+----
+
+During execution, you will be prompted to enter:
+* The source environment identifier (e.g., 883409)
+* The target environment identifier (e.g., f09f1b)
+* Whether to redeploy the target container (enter `y` or `n`)
+
+== Notes
+
+* Always back up both environments before running the migration.
+* This script transfers only the Directus schema and the file structure (folder configuration) from the source to the target.
+  - Image files themselves are transferred via the uploads volume archive.
+  - Collection items (e.g., articles) are not migrated.
+* The script automatically deletes and overwrites old snapshots and backup files to avoid clutter.
+
+== Discussion and Feedback
+
+This repository is shared to help others who need a simple method to transfer Directus configurations.  
+If you know of a better, more comprehensive way to perform a bulk migration of Directus collections and file structures, please share your ideas or improvements via GitHub Issues or pull requests.
+
+== Summary
+
+By following this guide, you can set up and run *deploy_schema_transfer.sh* in your home directory to automate the transfer of Directus schema and file configurations from one environment to another safely and efficiently.
+
+== License
+
+[Specify your license, e.g., MIT License]
+
+== Contributing
+
+Contributions and suggestions are welcome. Please open an issue or submit a pull request.
+
+== Contact
+
+For further questions or feedback, please use the GitHub Issues section of this repository.
